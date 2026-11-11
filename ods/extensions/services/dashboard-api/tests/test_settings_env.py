@@ -1359,6 +1359,7 @@ def test_render_env_preserves_commented_key_absent_from_values(commented_example
         "TARGET_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
+        "XAI_API_KEY",
         "TOGETHER_API_KEY",
         "LIVEKIT_API_KEY",
         "AUDIO_STT_OPENAI_API_KEY",

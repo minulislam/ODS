@@ -505,12 +505,56 @@ describe('ODSTalk', () => {
     render(<ODSTalk />)
 
     expect(await screen.findByText('Ready')).toBeInTheDocument()
-    expect(screen.getByText(/Live mic needs HTTPS/i)).toBeInTheDocument()
+    expect(screen.getByText(/Live voice needs HTTPS/i)).toBeInTheDocument()
     // Paperclip is now the general image/file attach button (it used to be
     // mis-wired to "Attach voice message" + capture, which made iOS open
-    // the video recorder).
+    // the video recorder). Mic icon is reserved for dictation — voice mode
+    // uses a waveform control only on a secure origin with XAI_API_KEY.
     expect(screen.getByRole('button', { name: 'Attach image or file' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Start voice mode' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Record voice' })).not.toBeInTheDocument()
+  })
+
+  test('shows waveform voice control when Grok voice is configured on a secure origin', async () => {
+    Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true })
+    Object.defineProperty(window, 'AudioContext', {
+      configurable: true,
+      value: class {
+        constructor() { this.sampleRate = 48000; this.state = 'running' }
+        resume() { return Promise.resolve() }
+        close() { return Promise.resolve() }
+      },
+    })
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn() },
+    })
+    const fetchMock = vi.fn(async (url) => {
+      if (url === '/api/talk/status') {
+        return response({
+          capabilities: {
+            text_chat: true,
+            tts: false,
+            audio_message: false,
+            grok_voice: true,
+            live_mic_requires_secure_context: true,
+          },
+        })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<ODSTalk />)
+    expect(await screen.findByText('Ready')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start voice mode' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Send message' })).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('Message ODS'), {
+      target: { value: 'hello' },
+    })
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Start voice mode' })).not.toBeInTheDocument()
   })
 
   test('can request spoken replies without blocking text chat', async () => {

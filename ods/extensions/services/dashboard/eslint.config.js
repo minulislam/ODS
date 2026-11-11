@@ -36,6 +36,11 @@ export default [
         alert: "readonly",
         prompt: "readonly",
         performance: "readonly",
+        Blob: "readonly",
+        WebSocket: "readonly",
+        AudioWorkletNode: "readonly",
+        btoa: "readonly",
+        atob: "readonly",
         // Vite
         process: "readonly",
       },

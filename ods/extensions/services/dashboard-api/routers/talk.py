@@ -582,6 +582,11 @@ async def talk_status(request: Request) -> dict[str, Any]:
             "text_chat": text_chat_ready,
             "tts": tts.get("status") == "healthy",
             "audio_message": voice_ready,
+            # Grok duplex voice needs an xAI key on the host; mic still needs HTTPS.
+            "grok_voice": bool(
+                (os.environ.get("XAI_API_KEY") or "").strip()
+                or (read_env_file_value("XAI_API_KEY", INSTALL_DIR) or "").strip()
+            ),
             "live_mic_requires_secure_context": True,
         },
         "reason": talk_block_reason,

@@ -269,6 +269,11 @@ services:
       # Model id of the vision-capable variant. Defaults to the user.*
       # name we register on AMD install (Qwen3.6-35B-A3B + mmproj-F16).
       - ODS_TALK_VISION_MODEL=${ODS_TALK_VISION_MODEL:-user.Qwen3.6-35B-A3B-Vision}
+      # Grok Speech-to-Speech for ODS Talk duplex voice. Long-lived key stays
+      # server-side; browsers mint ephemeral client secrets via /api/voice/client-secret.
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      # Dev-only voice NDJSON sink (POST /api/voice/log). Set to 1 to enable.
+      - VOICE_LOG=${VOICE_LOG:-}
     volumes:
       - ./scripts:/ods/scripts:ro,z
       - ./config:/ods/config:ro,z

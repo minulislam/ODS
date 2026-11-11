@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import {
-  AlertCircle, CheckCircle2, Loader2, Mic, Paperclip, RefreshCw,
-  Send, Volume2, VolumeX,
+  AlertCircle, CheckCircle2, Loader2, Paperclip, RefreshCw,
+  Send, Square, Volume2, VolumeX,
 } from 'lucide-react'
+import VoiceWaveformButton from '../components/VoiceWaveformButton'
+import { startGrokVoiceSession } from '../lib/voice/grokSession'
 
 // Hermes likes to format with markdown (bold, lists, code). Rendering it as
 // HTML keeps the chat bubbles readable instead of showing raw `**` and `-`.
@@ -59,7 +61,6 @@ export default function ODSTalk() {
   // repeated failure otherwise leaves every dependency unchanged.
   const [statusAttempt, setStatusAttempt] = useState(0)
   const [sending, setSending] = useState(false)
-  const [recording, setRecording] = useState(false)
   const [spokenReplies, setSpokenReplies] = useState(() => {
     try {
       return globalThis.localStorage?.getItem('ods-talk-spoken-replies') === '1'
@@ -70,8 +71,11 @@ export default function ODSTalk() {
   const [voiceState, setVoiceState] = useState({
     tts: false,
     audioMessage: false,
-    liveMic: false,
+    grokVoice: false,
   })
+  const [voicePhase, setVoicePhase] = useState('idle')
+  const [voiceSessionId, setVoiceSessionId] = useState('')
+  const [voiceError, setVoiceError] = useState('')
 
   const [pendingAttachment, setPendingAttachment] = useState(null)
   // {file: File, previewUrl: string|null, kind: 'image'|'text', name: string}
@@ -80,9 +84,10 @@ export default function ODSTalk() {
 
   const bottomRef = useRef(null)
   const fileInputRef = useRef(null)
-  const recorderRef = useRef(null)
-  const recordingChunksRef = useRef([])
   const streamControllerRef = useRef(null)
+  const grokSessionRef = useRef(null)
+  const voiceUserRowsRef = useRef(new Map())
+  const voiceAssistantRowsRef = useRef(new Map())
   // Track the currently-playing TTS state so we can shut down whatever
   // is in flight before starting the next reply's audio.
   const activeSpeechRef = useRef(null)
@@ -105,12 +110,12 @@ export default function ODSTalk() {
     return audioElementRef.current
   }, [])
 
-  const liveMicSupported = useMemo(() => {
+  const grokVoiceSupported = useMemo(() => {
     return Boolean(
       typeof window !== 'undefined' &&
       window.isSecureContext &&
       navigator.mediaDevices?.getUserMedia &&
-      globalThis.MediaRecorder,
+      (window.AudioContext || window.webkitAudioContext),
     )
   }, [])
 
@@ -132,9 +137,9 @@ export default function ODSTalk() {
       setVoiceState({
         tts: Boolean(capabilities.tts),
         audioMessage: Boolean(capabilities.audio_message),
-        liveMic: Boolean(liveMicSupported && capabilities.audio_message),
+        grokVoice: Boolean(grokVoiceSupported && capabilities.grok_voice),
       })
-      if (!capabilities.text_chat) {
+      if (!capabilities.text_chat && !capabilities.grok_voice) {
         setStatus('offline')
         setStatusText(compatibilityReason || 'ODS Talk text chat is not available.')
         setRetryStatusRefresh(!compatibilityReason)
@@ -148,7 +153,7 @@ export default function ODSTalk() {
       setStatusText(err.message || 'ODS Talk is offline.')
       setRetryStatusRefresh(true)
     }
-  }, [liveMicSupported])
+  }, [grokVoiceSupported])
 
   useEffect(() => { refreshStatus() }, [refreshStatus])
 
@@ -188,6 +193,8 @@ export default function ODSTalk() {
     return () => {
       streamControllerRef.current?.abort()
       streamControllerRef.current = null
+      grokSessionRef.current?.stop?.({ by: 'unmount' })
+      grokSessionRef.current = null
     }
   }, [])
 
@@ -531,81 +538,76 @@ export default function ODSTalk() {
     }
   }, [sending, speak, status])
 
-  const sendAudioFile = useCallback(async (file) => {
-    if (!file || sending || status === 'expired') return
-    setSending(true)
-    const userId = makeId('voice')
-    const assistantId = makeId('assistant')
-    setMessages(items => [
-      ...items,
-      { id: userId, role: 'user', text: 'Voice message', status: 'pending' },
-      { id: assistantId, role: 'assistant', text: '', status: 'pending' },
-    ])
+  const stopGrokVoice = useCallback(async () => {
+    const session = grokSessionRef.current
+    grokSessionRef.current = null
+    setVoicePhase('idle')
+    if (session) {
+      try { await session.stop({ by: 'client' }) } catch { /* ignore */ }
+    }
+  }, [])
 
+  const startGrokVoice = useCallback(async () => {
+    if (!voiceState.grokVoice || grokSessionRef.current || sending || status !== 'ready') return
+    setVoiceError('')
+    setVoicePhase('connecting')
+    voiceUserRowsRef.current = new Map()
+    voiceAssistantRowsRef.current = new Map()
+    // Spoken Kokoro TTS fights the duplex player — pause it for the session.
+    stopActiveSpeech()
     try {
-      const body = new FormData()
-      body.set('file', file, file.name || 'ods-talk-audio.webm')
-      const resp = await fetch('/api/talk/audio-message', {
-        method: 'POST',
-        body,
-        credentials: 'same-origin',
+      const session = await startGrokVoiceSession({
+        onSessionMeta: ({ sessionId }) => setVoiceSessionId(sessionId),
+        onPhase: (phase) => setVoicePhase(phase),
+        onUserTranscript: ({ itemId, text, pending }) => {
+          if (!itemId) return
+          const existing = voiceUserRowsRef.current.get(itemId)
+          if (!existing) {
+            const id = makeId('voice-user')
+            voiceUserRowsRef.current.set(itemId, id)
+            setMessages(items => [
+              ...items,
+              { id, role: 'user', text: text || (pending ? '…' : ''), status: pending ? 'pending' : 'done' },
+            ])
+            return
+          }
+          setMessages(items => items.map(item => (
+            item.id === existing
+              ? { ...item, text: text || item.text, status: pending ? 'pending' : 'done' }
+              : item
+          )))
+        },
+        onAssistantTranscript: ({ responseId, delta, text, done }) => {
+          const key = responseId || 'assistant'
+          let rowId = voiceAssistantRowsRef.current.get(key)
+          if (!rowId) {
+            rowId = makeId('voice-assistant')
+            voiceAssistantRowsRef.current.set(key, rowId)
+            setMessages(items => [
+              ...items,
+              { id: rowId, role: 'assistant', text: text || delta || '', status: done ? 'done' : 'pending' },
+            ])
+            return
+          }
+          setMessages(items => items.map(item => {
+            if (item.id !== rowId) return item
+            if (done && text) return { ...item, text, status: 'done' }
+            if (delta) return { ...item, text: `${item.text || ''}${delta}`, status: 'pending' }
+            return item
+          }))
+        },
+        onError: (err) => {
+          setVoiceError(err.message || `Voice error (voice session ${voiceSessionId || 'unknown'})`)
+        },
       })
-      if (resp.status === 401) {
-        setStatus('expired')
-        setStatusText('Session expired. Scan the owner card again.')
-        throw new Error('Session expired.')
-      }
-      if (!resp.ok) throw new Error(await parseError(resp, 'Voice message could not be sent.'))
-      const data = await resp.json()
-      const reply = data.text || 'I did not get a response back.'
-      setMessages(items => items.map(item => {
-        if (item.id === userId) return { ...item, text: data.transcript || 'Voice message', status: 'done' }
-        if (item.id === assistantId) return { ...item, text: reply, status: 'done', warning: data.warning || null }
-        return item
-      }))
-      speak(reply)
+      grokSessionRef.current = session
+      setVoiceSessionId(session.sessionId)
     } catch (err) {
-      setMessages(items => items.map(item => {
-        if (item.id === userId) return { ...item, status: 'error' }
-        if (item.id === assistantId) return { ...item, text: err.message || 'Something went wrong.', status: 'error' }
-        return item
-      }))
-    } finally {
-      setSending(false)
+      setVoicePhase('idle')
+      const message = err.message || 'Could not start voice mode.'
+      setVoiceError(/voice session/i.test(message) ? message : `${message} (voice session unknown)`)
     }
-  }, [sending, speak, status])
-
-  const startRecording = async () => {
-    if (!voiceState.liveMic || recording || sending) return
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const recorder = new MediaRecorder(stream)
-      recordingChunksRef.current = []
-      recorder.ondataavailable = event => {
-        if (event.data?.size) recordingChunksRef.current.push(event.data)
-      }
-      recorder.onstop = () => {
-        stream.getTracks().forEach(track => track.stop())
-        const blob = new Blob(recordingChunksRef.current, { type: recorder.mimeType || 'audio/webm' })
-        if (blob.size > 0) {
-          sendAudioFile(new File([blob], 'recording.webm', { type: blob.type || 'audio/webm' }))
-        }
-      }
-      recorderRef.current = recorder
-      recorder.start()
-      setRecording(true)
-    } catch {
-      setVoiceState(current => ({ ...current, liveMic: false }))
-    }
-  }
-
-  const stopRecording = () => {
-    const recorder = recorderRef.current
-    if (!recorder || recorder.state === 'inactive') return
-    recorder.stop()
-    recorderRef.current = null
-    setRecording(false)
-  }
+  }, [sending, status, stopActiveSpeech, voiceState.grokVoice])
 
   const handleAttachmentPicked = useCallback((file) => {
     if (!file || sending || status === 'expired') return
@@ -626,8 +628,22 @@ export default function ODSTalk() {
     })
   }, [])
 
+  const voiceActive = voicePhase !== 'idle'
+
   const submit = (event) => {
     event.preventDefault()
+    const clean = input.trim()
+    if (voiceActive && clean && !pendingAttachment) {
+      const sent = grokSessionRef.current?.sendText?.(clean)
+      if (sent) {
+        setMessages(items => [
+          ...items,
+          { id: makeId('voice-text'), role: 'user', text: clean, status: 'done' },
+        ])
+        setInput('')
+      }
+      return
+    }
     if (pendingAttachment) {
       sendText(input, { attachment: pendingAttachment })
     } else {
@@ -643,6 +659,34 @@ export default function ODSTalk() {
   // Send is enabled either with text OR an attachment (an image alone is a
   // valid message — the model gets a default "describe this" prompt).
   const canSend = (input.trim().length > 0 || pendingAttachment) && !sending && status === 'ready'
+  const showWaveform = voiceState.grokVoice && !pendingAttachment && input.trim().length === 0
+  const composerPlaceholder = (() => {
+    if (!voiceActive) return 'Message ODS'
+    const label = {
+      connecting: 'Connecting…',
+      listening: 'Listening…',
+      thinking: 'Thinking…',
+      speaking: 'Speaking…',
+      idle: 'Message ODS',
+    }[voicePhase] || 'Listening…'
+    return voiceSessionId ? `${label.replace('…', '')} · session ${voiceSessionId}` : label
+  })()
+
+  const primaryAction = () => {
+    if (sending) {
+      streamControllerRef.current?.abort()
+      return
+    }
+    if (showWaveform) {
+      if (voiceActive) stopGrokVoice()
+      else startGrokVoice()
+      return
+    }
+    // Text present → submit (into duplex session or Hermes).
+    if (canSend || (voiceActive && input.trim())) {
+      submit({ preventDefault() {} })
+    }
+  }
 
   return (
     <div className="min-h-dvh bg-[#f8faf8] text-zinc-950 antialiased">
@@ -706,9 +750,15 @@ export default function ODSTalk() {
 
         {typeof window !== 'undefined' && !window.isSecureContext && (
           <div className="mx-4 mb-3 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-600">
-            Live mic needs HTTPS. Text chat still works here, and your phone may offer native audio capture.
+            Live voice needs HTTPS. Text chat still works here.
           </div>
         )}
+
+        {voiceError ? (
+          <div className="mx-4 mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+            {voiceError}
+          </div>
+        ) : null}
 
         <form onSubmit={submit} className="sticky bottom-0 border-t border-zinc-200 bg-[#f8faf8]/95 p-3 backdrop-blur">
           {/* Attachment preview strip — appears above the input bar between
@@ -743,7 +793,7 @@ export default function ODSTalk() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={sending || status === 'expired' || pendingAttachment}
+              disabled={sending || status === 'expired' || pendingAttachment || voiceActive}
               className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-zinc-500 disabled:opacity-40"
               aria-label="Attach image or file"
               title="Attach image or file"
@@ -756,37 +806,37 @@ export default function ODSTalk() {
               onKeyDown={event => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
-                  if (canSend) sendText(input)
+                  primaryAction()
                 }
               }}
               rows={1}
-              placeholder="Message ODS"
+              placeholder={composerPlaceholder}
               className="max-h-32 min-h-11 flex-1 resize-none bg-transparent px-1 py-2.5 text-[16px] leading-6 text-zinc-950 outline-none placeholder:text-zinc-400"
               disabled={status === 'expired'}
             />
-            {voiceState.liveMic ? (
+            <span className="sr-only" role="status">
+              {voiceActive ? composerPlaceholder : ''}
+            </span>
+            {showWaveform ? (
+              <VoiceWaveformButton
+                active={voiceActive}
+                phase={voicePhase}
+                disabled={status !== 'ready'}
+                onClick={primaryAction}
+                label={voiceActive ? 'Stop voice mode' : 'Start voice mode'}
+              />
+            ) : (
               <button
                 type="button"
-                onClick={recording ? stopRecording : startRecording}
-                disabled={sending}
-                className={`grid h-11 w-11 shrink-0 place-items-center rounded-full ${
-                  recording ? 'bg-red-600 text-white' : 'bg-zinc-100 text-zinc-700'
-                } disabled:opacity-40`}
-                aria-label={recording ? 'Stop recording' : 'Record voice'}
-                title={recording ? 'Stop recording' : 'Record'}
+                onClick={primaryAction}
+                disabled={sending ? false : !(canSend || (voiceActive && input.trim()))}
+                className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-zinc-950 text-white disabled:bg-zinc-200 disabled:text-zinc-400"
+                aria-label={sending ? 'Stop response' : 'Send message'}
+                title={sending ? 'Stop' : 'Send'}
               >
-                {recording ? <Loader2 size={18} className="animate-spin" /> : <Mic size={18} />}
+                {sending ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
               </button>
-            ) : null}
-            <button
-              type="submit"
-              disabled={!canSend}
-              className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-zinc-950 text-white disabled:bg-zinc-200 disabled:text-zinc-400"
-              aria-label="Send message"
-              title="Send"
-            >
-              {sending ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
-            </button>
+            )}
           </div>
           {messages.some(message => message.status === 'error') && (
             <div className="mt-2 flex justify-end">
