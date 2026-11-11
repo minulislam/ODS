@@ -9,8 +9,9 @@ const DEFAULT_INSTRUCTIONS = [
   'If you are unsure, say so briefly.',
 ].join(' ')
 
-function voiceLoggingEnabled() {
+function voiceLoggingEnabled(force = false) {
   try {
+    if (force) return true
     if (import.meta.env?.DEV) return true
     if (import.meta.env?.MODE === 'test') return true
     return globalThis.localStorage?.getItem('ods-voice-log') === '1'
@@ -31,9 +32,10 @@ export async function startGrokVoiceSession({
   onAssistantTranscript,
   onError,
   onSessionMeta,
+  enableLogging = false,
 } = {}) {
   const sessionId = makeVoiceSessionId()
-  const logger = createVoiceLogger(sessionId, { enabled: voiceLoggingEnabled() })
+  const logger = createVoiceLogger(sessionId, { enabled: voiceLoggingEnabled(enableLogging) })
   onSessionMeta?.({ sessionId })
 
   let phase = 'connecting'

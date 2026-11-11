@@ -587,6 +587,14 @@ async def talk_status(request: Request) -> dict[str, Any]:
                 (os.environ.get("XAI_API_KEY") or "").strip()
                 or (read_env_file_value("XAI_API_KEY", INSTALL_DIR) or "").strip()
             ),
+            # Mirrors routers.voice._voice_logging_enabled for the browser logger.
+            "voice_log": (
+                (os.environ.get("VOICE_LOG") or "").strip() == "1"
+                or (os.environ.get("ODS_ENV") or os.environ.get("ENVIRONMENT") or "")
+                .strip()
+                .lower()
+                in ("development", "dev", "local", "test")
+            ),
             "live_mic_requires_secure_context": True,
         },
         "reason": talk_block_reason,

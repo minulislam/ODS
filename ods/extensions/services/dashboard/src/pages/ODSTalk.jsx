@@ -72,6 +72,7 @@ export default function ODSTalk() {
     tts: false,
     audioMessage: false,
     grokVoice: false,
+    voiceLog: false,
   })
   const [voicePhase, setVoicePhase] = useState('idle')
   const [voiceSessionId, setVoiceSessionId] = useState('')
@@ -138,6 +139,7 @@ export default function ODSTalk() {
         tts: Boolean(capabilities.tts),
         audioMessage: Boolean(capabilities.audio_message),
         grokVoice: Boolean(grokVoiceSupported && capabilities.grok_voice),
+        voiceLog: Boolean(capabilities.voice_log),
       })
       if (!capabilities.text_chat && !capabilities.grok_voice) {
         setStatus('offline')
@@ -557,6 +559,7 @@ export default function ODSTalk() {
     stopActiveSpeech()
     try {
       const session = await startGrokVoiceSession({
+        enableLogging: voiceState.voiceLog,
         onSessionMeta: ({ sessionId }) => setVoiceSessionId(sessionId),
         onPhase: (phase) => setVoicePhase(phase),
         onUserTranscript: ({ itemId, text, pending }) => {
@@ -607,7 +610,7 @@ export default function ODSTalk() {
       const message = err.message || 'Could not start voice mode.'
       setVoiceError(/voice session/i.test(message) ? message : `${message} (voice session unknown)`)
     }
-  }, [sending, status, stopActiveSpeech, voiceState.grokVoice])
+  }, [sending, status, stopActiveSpeech, voiceState.grokVoice, voiceState.voiceLog])
 
   const handleAttachmentPicked = useCallback((file) => {
     if (!file || sending || status === 'expired') return
